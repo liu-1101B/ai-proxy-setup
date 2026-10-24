@@ -137,7 +137,7 @@ class ProxyDoctorRedactionTests(unittest.TestCase):
         self.assertEqual(base, "http://127.0.0.1:9799")
         self.assertEqual(error, "")
 
-    @patch("proxy_doctor.subprocess.run")
+    @patch.object(proxy_doctor.subprocess, "run")
     def test_gnome_proxy_state_reads_manual_mode_and_ignore_hosts(self, mock_run):
         def fake_run(command, **kwargs):
             key = command[3]
