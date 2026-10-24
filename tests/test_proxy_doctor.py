@@ -2,6 +2,7 @@
 from pathlib import Path
 import importlib.util
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "proxy_doctor.py"
@@ -135,6 +136,33 @@ class ProxyDoctorRedactionTests(unittest.TestCase):
         base, error = proxy_doctor._validate_controller_url("http://127.0.0.1:9799/")
         self.assertEqual(base, "http://127.0.0.1:9799")
         self.assertEqual(error, "")
+
+    @patch("proxy_doctor.subprocess.run")
+    def test_gnome_proxy_state_reads_manual_mode_and_ignore_hosts(self, mock_run):
+        def fake_run(command, **kwargs):
+            key = command[3]
+            values = {
+                "mode": "'manual'",
+                "ignore-hosts": "['localhost', 'hif-leim.deepseek.com']",
+                "host": "'127.0.0.1'",
+                "port": "7897",
+            }
+            return type(
+                "Completed",
+                (),
+                {"returncode": 0, "stdout": values[key] + "\n", "stderr": ""},
+            )()
+
+        mock_run.side_effect = fake_run
+        state = proxy_doctor._gnome_proxy_state()
+        self.assertEqual(state["mode"], "'manual'")
+        self.assertEqual(
+            proxy_doctor._parse_gsettings_array(state["ignore-hosts"]),
+            ["localhost", "hif-leim.deepseek.com"],
+        )
+        self.assertEqual(state["http-host"], "'127.0.0.1'")
+        self.assertEqual(state["http-port"], "7897")
+        self.assertNotIn("_error", state)
 
     def test_gsettings_list_parser(self):
         self.assertEqual(
