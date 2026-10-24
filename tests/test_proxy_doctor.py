@@ -73,10 +73,14 @@ class ProxyDoctorRedactionTests(unittest.TestCase):
         self.assertIn("HTTPS_PROXY", values)
 
     def test_proc_environ_parser_splits_nul_delimited_values(self):
-        values = proxy_doctor._parse_proc_env_bytes(
-            b"PATH=/bin\\0HTTP_PROXY=http://127.0.0.1:7897\\0"
-            b"NO_PROXY=localhost,deepseek.com\\0SECRET=should-not-be-returned\\0"
+        nul = bytes([0])
+        raw = (
+            b"PATH=/bin" + nul
+            + b"HTTP_PROXY=http://127.0.0.1:7897" + nul
+            + b"NO_PROXY=localhost,deepseek.com" + nul
+            + b"SECRET=should-not-be-returned" + nul
         )
+        values = proxy_doctor._parse_proc_env_bytes(raw)
         self.assertEqual(values["HTTP_PROXY"], "http://127.0.0.1:7897")
         self.assertEqual(values["NO_PROXY"], "localhost,deepseek.com")
         self.assertNotIn("SECRET", values)
