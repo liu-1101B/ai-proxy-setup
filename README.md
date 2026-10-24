@@ -1,65 +1,84 @@
 # ai-proxy-setup
 
-给 AI 工具（DSH / Electron 应用 / Playwright 浏览器 / CLI 子进程）配置本机网络代理的**实战手册**。
+给 AI 工具配置本机网络代理的 Windows/Linux 实战手册与诊断工具。重点不是“代理变量有没有设置”，而是确认**具体应用实际走了哪条网络通道**。
 
-不是"设置环境变量就完了"的教程——这里记录的是**配置看起来正确、实际却没生效**时该看哪里，
-以及三个由代理引发的真实故障（模型连接中断、游戏无法启动、写操作被 TLS 重置）的复盘。
+## 五条通道，互不替代
 
-## 一句话原则
+| 通道 | 例子 | 绕过配置 |
+|---|---|---|
+| A. 进程环境变量 | 会读取 `HTTP_PROXY` / `HTTPS_PROXY` 的客户端与子进程 | `NO_PROXY`，部分 Node 内置 fetch 需要 `NODE_USE_ENV_PROXY=1` |
+| B. 浏览器启动参数 | Playwright 启动的 Chromium | 浏览器代理参数和 bypass list |
+| C. CLI / 应用自有配置 | curl、git、pip、npm 或应用专属 HTTP 客户端 | 各工具自己的参数/配置 |
+| D. 桌面系统代理 | Linux GNOME manual proxy；本次 DSH/Tauri + Ninja 案例 | GNOME `org.gnome.system.proxy ignore-hosts` |
+| E. 内核/网络接管 | mihomo TUN、透明代理、路由、DNS | 内核规则和网络配置 |
 
-> **四条通道各配各的；`NO_PROXY` 保住命脉；验证要用真正使用该网络的进程；失败先重试 3 次；全局/TUN 是核武器。**
+**重要：** `NO_PROXY` 只对真实读取它的客户端生效。走 GNOME 桌面系统代理的请求要单独核对 `ignore-hosts`；走 TUN 的流量也不能只看环境变量判断。以当前连接的 mihomo `/connections` 中的 `metadata.host` 与 `chains` 为准。
 
-## 快速开始
+## Linux / GNOME 实战检查
 
-```powershell
-$p = 'http://127.0.0.1:7890'   # 换成你的混合端口
-
-[Environment]::SetEnvironmentVariable('HTTP_PROXY',  $p, 'User')
-[Environment]::SetEnvironmentVariable('HTTPS_PROXY', $p, 'User')
-[Environment]::SetEnvironmentVariable('ALL_PROXY',   $p, 'User')
-[Environment]::SetEnvironmentVariable('NODE_USE_ENV_PROXY', '1', 'User')   # Node 内置 fetch 需要
-[Environment]::SetEnvironmentVariable('NO_PROXY',
-  '127.0.0.1,localhost,::1,<模型/API/内网域名>', 'User')                    # 命脉直连
-```
-
-然后**重启目标应用**（环境变量是进程启动时读的），再验证：
+查看 GNOME 系统代理状态：
 
 ```bash
-python scripts/proxy_doctor.py --proxy http://127.0.0.1:7890
+gsettings get org.gnome.system.proxy mode
+gsettings get org.gnome.system.proxy.http host
+gsettings get org.gnome.system.proxy.http port
+gsettings get org.gnome.system.proxy.https host
+gsettings get org.gnome.system.proxy.https port
+gsettings get org.gnome.system.proxy ignore-hosts
 ```
 
-### 诊断数据与隐私
+查看真实目标进程携带的环境变量（仅在本机终端执行；可能暴露代理凭据，不要直接分享原始输出）：
 
-- 默认会通过 HTTPS 请求公共 IP 查询服务来比较“经代理”和“直连”的出口 IP；这些服务会看到发起请求的公网 IP。使用 `--skip-ip` 可跳过这一步。
-- 输出中的代理 URL 凭据、查询参数值和自定义 `NO_PROXY` 主机名会做脱敏处理，但这不是完整的敏感信息审计。分享诊断日志前仍应人工检查。
-- 不要把包含访问令牌、用户名/密码或内部域名的原始环境变量粘贴到公开 Issue。
+```bash
+tr '\0' '\n' < /proc/<PID>/environ | grep -Ei '^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|NODE_USE_ENV_PROXY)='
+```
 
-## 四条通道（互不替代）
+本次实践中，DSH 专属配置在 `~/.dsh/.env`，但 DSH 桌面端的请求由 Rust/Tauri 客户端通过 GNOME 系统代理发出；`NO_PROXY` 对这条系统代理通道没有隔离作用。具体行为依客户端版本和实际网络栈而定，请在自己的机器上用当前连接验证。
 
-| 通道 | 谁在用 | 认什么 |
-|---|---|---|
-| A. 环境变量 | Node / Electron（DSH 的 `web_fetch`、argo 子进程） | `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY` + `NODE_USE_ENV_PROXY=1` |
-| B. 启动参数 | Playwright 拉起的 Chrome/Edge | `--proxy-server=<url>`（不读环境变量） |
-| C. CLI 自身 | `curl`/`git`/`pip`/`npm` | `ALL_PROXY` 或各自参数 |
-| D. 系统级 | 一切程序 | TUN 网卡 / 系统代理 / PAC |
+## proxy_doctor.py
 
-## 五个最容易踩的坑
+仅使用 Python 标准库，支持读取进程环境、DSH dotenv、Linux GNOME 系统代理、可选的 `/proc/<PID>/environ`，以及 mihomo Controller 的只读状态。
 
-1. **`NO_PROXY` 不排模型域名** → 模型连接被塞进代理 → `transport failed`（真实发生过）
-2. **只设环境变量、不设 `NODE_USE_ENV_PROXY=1`** → Node 内置 fetch 照旧直连
-3. **用 `pwsh` 里的 `curl.exe` 判 HTTPS** → 可能全 `000`，是 shell 假象不是网络结论
-4. **用沙箱子进程的结果下结论** → 子进程有独立网络限制，既不能证通也不能证不通
-5. **删了注册表变量但仍走代理** → 已运行进程持有旧值，必须重启进程
+```bash
+# 测试指定代理并跳过公网 IP 对比
+python scripts/proxy_doctor.py --proxy http://127.0.0.1:7897 --skip-ip
 
-## 全局 / TUN 的副作用
+# 从 mihomo Controller 读取 GLOBAL 与实时连接
+export MIHOMO_CONTROLLER_SECRET='本机配置中的 secret'
+python scripts/proxy_doctor.py \
+  --proxy http://127.0.0.1:7897 \
+  --controller http://127.0.0.1:9799 \
+  --secret-env MIHOMO_CONTROLLER_SECRET \
+  --pid <PID> --skip-ip
 
-会波及：**游戏与反作弊**（登录组件报错、被强制关闭）、**证书固定的客户端**、**内网系统**。
-遇到"开代理就坏、关代理就好"的软件，**先假设是代理**，再去找不矛盾的解释。
+# 显示完整 NO_PROXY / GNOME ignore-hosts（可能暴露内网域名）
+python scripts/proxy_doctor.py --controller http://127.0.0.1:9799 --secret-env MIHOMO_CONTROLLER_SECRET --show-bypass-hosts --skip-ip
+```
 
-## 详细内容
+`--controller` 只读请求 `/proxies` 和 `/connections`，可显示 `GLOBAL.now`、当前选择的节点/组类型，以及实时 `metadata.host` / `chains`。脚本不会自动更改 GLOBAL。远程 Controller 不允许使用明文 HTTP；本机 Loopback HTTP 可用。为避免 secret 出现在系统进程列表中，优先用 `--secret-env`，不推荐把真实 secret 直接放在命令行中。
 
-完整方法、故障树、按需开关、两个真实案例复盘 → [SKILL.md](SKILL.md)
+### 故障判定纪律
 
-## 许可
+1. **先检查端口，再看 GUI**：GUI 仍在不代表 mihomo 内核活着。端口/Controller 拒绝连接时，考虑内核已经退出。
+2. **内核活着不代表选中节点活着**：看 `/proxies` 的 `GLOBAL.now` 及该条目的 `type`。GLOBAL 钉在叶子节点并持续恒定超时时，别只重试三次；考虑把持久配置中的默认选项改为 URLTest/Fallback 组。
+3. **域名只从实时 `/connections` 复制**：不信旧日志、截图或印象；同时检查 `chains`。
+4. **三层各管各的**：目标进程环境、`~/.dsh/.env`、GNOME `ignore-hosts` 不是同一份配置。
+5. **Controller 改动可能不落盘**：内核重启后再次检查端口和 `GLOBAL.now`。本次 Ninja 配置中的 `auto_launch: false` 还意味着重启后不能假定内核自动启动；先手动确认/启动内核，再复查选择。要持久化应修改受管理的配置文件/订阅覆写，或把复查加入每次重启清单。
+6. **undici 不应使用 CIDR 绕过规则**：本次使用场景中 `10.0.0.0/8` 不生效；按目标客户端支持的语法逐项配置实际 IP/hostname。
+
+## 隐私与沙箱边界
+
+- `proxy_doctor.py` 会对代理 URL 凭据、查询参数和自定义绕过主机名做默认脱敏；`--show-bypass-hosts` 会显式输出完整值。
+- 若未指定 `--skip-ip`，脚本会通过 HTTPS 公共服务查询出口 IP；服务方会看到请求的公网 IP。
+- 受限 Agent 沙箱可能无法访问 GNOME 用户会话的 D-Bus/dconf，也可能无法读取其他用户/受限 PID 的 `/proc` 环境。出现 `unavailable` 不等于代理设置为空；需要写系统代理时可能必须由用户在桌面会话中手动执行 `gsettings`。
+- 不要将 Controller secret、代理账号密码或未经检查的完整诊断日志粘贴到公开 Issue。
+
+## 相关文件
+
+- `SKILL.md`：五通道模型、Linux/Windows 操作细节、故障树和案例。
+- `scripts/proxy_doctor.py`：代理诊断脚本。
+- `tests/test_proxy_doctor.py`：离线回归测试。
+
+## License
 
 MIT
