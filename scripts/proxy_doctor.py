@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import ipaddress
 import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -44,13 +47,86 @@ DEFAULT_TARGETS = [
 IP_ENDPOINTS = ["https://api.ipify.org", "https://api.ip.sb/ip"]
 
 
-def _load_proxy_from_env() -> str | None:
-    for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
-                 "HTTP_PROXY", "http_proxy"):
-        value = os.environ.get(name, "").strip()
+PROXY_ENV_NAMES = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_USE_ENV_PROXY"
+)
+PROXY_ENV_LOOKUP_ORDER = (
+    "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
+    "HTTP_PROXY", "http_proxy"
+)
+
+
+def _load_proxy_from_values(values: dict[str, str]) -> str | None:
+    normalized = {key.upper(): value for key, value in values.items()}
+    for name in PROXY_ENV_LOOKUP_ORDER:
+        value = normalized.get(name.upper(), "").strip()
         if value:
             return value
     return None
+
+
+def _load_proxy_from_env() -> str | None:
+    return _load_proxy_from_values(dict(os.environ))
+
+
+def _parse_env_text(text: str) -> dict[str, str]:
+    """Parse only proxy-related keys from a dotenv-style file; ignore all else."""
+    parsed: dict[str, str] = {}
+    allowed = {name.upper() for name in PROXY_ENV_NAMES}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.upper() not in allowed:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        parsed[key.upper()] = value
+    return parsed
+
+
+def _read_proxy_env_file(path: Path) -> tuple[dict[str, str], str]:
+    try:
+        if not path.is_file():
+            return {}, "not found"
+        return _parse_env_text(path.read_text(encoding="utf-8")), ""
+    except (OSError, UnicodeError) as exc:
+        return {}, type(exc).__name__
+
+
+def _parse_proc_env_bytes(data: bytes) -> dict[str, str]:
+    """Extract only proxy-related environment variables from /proc/PID/environ."""
+    values = {}
+    allowed = {name.upper() for name in PROXY_ENV_NAMES}
+    for item in data.split(b"\\0"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        key_text = key.decode("utf-8", "replace")
+        if key_text.upper() in allowed:
+            values[key_text.upper()] = value.decode("utf-8", "replace")
+    return values
+
+
+def _read_proc_env(pid: int) -> tuple[dict[str, str], str]:
+    if not sys.platform.startswith("linux"):
+        return {}, "available only on Linux"
+    try:
+        data = Path("/proc") .joinpath(str(pid), "environ").read_bytes()
+        return _parse_proc_env_bytes(data), ""
+    except PermissionError:
+        return {}, "permission denied (try the same user, or inspect from the app's own child process)"
+    except FileNotFoundError:
+        return {}, "PID not found or process exited"
+    except OSError as exc:
+        return {}, type(exc).__name__
 
 
 def _safe_display_url(value: str) -> str:
@@ -147,6 +223,263 @@ def _env_layers() -> dict[str, dict[str, str]]:
             except Exception as exc:  # pragma: no cover - registry permissions
                 layers[layer_name] = {"error": str(exc)}
     return layers
+
+
+def _parse_gsettings_array(value: str) -> list[str]:
+    try:
+        parsed = ast.literal_eval(value)
+        if isinstance(parsed, (list, tuple)):
+            return [str(item) for item in parsed]
+    except (ValueError, SyntaxError):
+        pass
+    return []
+
+
+def _run_gsettings(schema: str, key: str) -> tuple[str, str]:
+    """Return (value, error) without requiring a GNOME session."""
+    try:
+        completed = subprocess.run(
+            ["gsettings", "get", schema, key],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "", "gsettings not installed"
+    except subprocess.TimeoutExpired:
+        return "", "timed out (desktop bus/session may be unavailable)"
+    except OSError as exc:
+        return "", type(exc).__name__
+    if completed.returncode != 0:
+        # Do not echo arbitrary stderr; it can include environment-specific details.
+        return "", "unavailable (schema/key or desktop session)"
+    return completed.stdout.strip(), ""
+
+
+def _gnome_proxy_state() -> dict[str, str]:
+    if not sys.platform.startswith("linux"):
+        return {"_error": "GNOME system proxy is only checked on Linux"}
+    keys = {
+        "mode": ("org.gnome.system.proxy", "mode"),
+        "ignore-hosts": ("org.gnome.system.proxy", "ignore-hosts"),
+        "http-host": ("org.gnome.system.proxy.http", "host"),
+        "http-port": ("org.gnome.system.proxy.http", "port"),
+        "https-host": ("org.gnome.system.proxy.https", "host"),
+        "https-port": ("org.gnome.system.proxy.https", "port"),
+        "socks-host": ("org.gnome.system.proxy.socks", "host"),
+        "socks-port": ("org.gnome.system.proxy.socks", "port"),
+    }
+    result = {}
+    errors = []
+    for name, (schema, key) in keys.items():
+        value, error = _run_gsettings(schema, key)
+        if error:
+            errors.append(name + ": " + error)
+        else:
+            result[name] = value
+    if errors:
+        result["_error"] = "; ".join(errors)
+    return result
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_controller_url(controller: str) -> tuple[str, str]:
+    raw = controller.strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "", "use an http(s) URL with a hostname"
+        if parsed.username or parsed.password:
+            return "", "do not put credentials in the controller URL; use --secret or --secret-env"
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            return "", "controller URL must contain only scheme, host and optional port"
+        if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+            return "", "refusing to send a controller secret over non-loopback HTTP; use localhost or HTTPS"
+        # Force port parsing now so invalid ports fail before the request.
+        _ = parsed.port
+        return raw.rstrip("/"), ""
+    except ValueError:
+        return "", "invalid controller URL or port"
+
+
+def _controller_get(controller: str, endpoint: str, secret: str | None) -> tuple[int, dict | None, str]:
+    base, error = _validate_controller_url(controller)
+    if error:
+        return 0, None, error
+    headers = {"Accept": "application/json", "User-Agent": "proxy-doctor/1.1"}
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+    request = urllib.request.Request(base + endpoint, headers=headers, method="GET")
+    # Never route loopback controller requests through HTTP_PROXY/ALL_PROXY.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=3) as response:
+            payload = json.loads(response.read(2_000_000).decode("utf-8"))
+            if not isinstance(payload, dict):
+                return response.status, None, "unexpected JSON response"
+            return response.status, payload, ""
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            return exc.code, None, "authentication failed; verify --secret/--secret-env"
+        return exc.code, None, "HTTP error"
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (ConnectionRefusedError, TimeoutError, socket.timeout)):
+            return 0, None, "connection refused or timed out"
+        return 0, None, "unreachable"
+    except (TimeoutError, socket.timeout):
+        return 0, None, "request timed out"
+    except (ValueError, json.JSONDecodeError):
+        return 0, None, "invalid JSON response"
+    except OSError:
+        return 0, None, "unreachable"
+
+
+def _proxy_map(payload: dict) -> dict:
+    proxies = payload.get("proxies", payload)
+    return proxies if isinstance(proxies, dict) else {}
+
+
+def _summarize_global(proxies_payload: dict) -> tuple[str, str, str, bool]:
+    """Return (current selection, selected type, message, selection-is-leaf)."""
+    proxies = _proxy_map(proxies_payload)
+    global_proxy = proxies.get("GLOBAL", {})
+    current = str(global_proxy.get("now", "")).strip()
+    selected = proxies.get(current, {})
+    selected_type = str(selected.get("type", "")).strip()
+    group_types = {"Selector", "URLTest", "Fallback", "LoadBalance", "Relay"}
+    is_leaf = bool(current and selected_type and selected_type not in group_types)
+    if not current:
+        message = "GLOBAL 当前选择未在响应中给出；请在 mihomo 面板/API 中核对。"
+    elif is_leaf:
+        message = (
+            "GLOBAL 当前指向叶子节点，而不是 URLTest/Fallback 等自动探测组。"
+            "若请求持续恒定超时，检查该节点是否失效；可考虑将 GLOBAL 切到自动选择组。"
+            "诊断脚本不会自动切换节点。"
+        )
+    else:
+        message = "未发现 GLOBAL 直接钉在叶子节点的明显迹象；这不证明所选节点可用。"
+    return current or "(unknown)", selected_type or "(unknown)", message, is_leaf
+
+
+def _connection_rows(payload: dict) -> list[tuple[str, str, str]]:
+    rows = []
+    for connection in payload.get("connections", []) or []:
+        if not isinstance(connection, dict):
+            continue
+        metadata = connection.get("metadata") or {}
+        host = str(metadata.get("host") or metadata.get("destinationIP") or "(unknown)")
+        chains = connection.get("chains") or []
+        chain = " > ".join(str(item) for item in chains) if chains else "(chain unknown)"
+        rule = str(connection.get("rule") or "")
+        rows.append((host, chain, rule))
+    return sorted(set(rows), key=lambda row: (row[0].lower(), row[1], row[2]))
+
+
+def _matching_proxy_processes() -> list[tuple[int, str]]:
+    """List probable proxy GUI/core processes by comm only; never print cmdline."""
+    if not sys.platform.startswith("linux") or not Path("/proc").is_dir():
+        return []
+    markers = ("mihomo", "clash", "ninja", "flclash")
+    matches = []
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text(encoding="utf-8").strip()
+            if any(marker in comm.lower() for marker in markers):
+                matches.append((int(entry.name), comm[:80]))
+        except OSError:
+            continue
+    return sorted(matches)
+
+
+def _display_env_layer(layer_name: str, values: dict[str, str], show_bypass_hosts: bool) -> None:
+    print("  " + layer_name + ":")
+    for name, value in values.items():
+        if name == "error":
+            print("    access: " + value)
+            continue
+        if not value:
+            shown = "(空)"
+        elif name.upper() in {"NO_PROXY", "no_proxy"} and show_bypass_hosts:
+            shown = value
+        else:
+            shown = _display_env_value(name, value)
+        print(f"    {name:<18} = {shown}")
+
+
+def _print_gnome_proxy(show_bypass_hosts: bool) -> None:
+    print("\\n[GNOME 桌面系统代理（gsettings）]")
+    state = _gnome_proxy_state()
+    if "_error" in state and not any(key in state for key in ("mode", "http-host", "https-host", "socks-host")):
+        print("  unavailable: " + state["_error"])
+        print("  这通常表示没有可用的 GNOME user session / dconf bus，或当前沙箱禁止访问。")
+        return
+    print("  mode = " + state.get("mode", "(unavailable)"))
+    for scheme in ("http", "https", "socks"):
+        host = state.get(scheme + "-host", "(unavailable)")
+        port = state.get(scheme + "-port", "(unavailable)")
+        print(f"  {scheme} = {host}:{port}")
+    ignored = _parse_gsettings_array(state.get("ignore-hosts", ""))
+    if show_bypass_hosts:
+        rendered = repr(ignored) if ignored else state.get("ignore-hosts", "(empty/unavailable)")
+    else:
+        rendered = _safe_no_proxy(",".join(ignored)) if ignored else "(empty/unavailable)"
+    print("  ignore-hosts = " + rendered)
+    if "_error" in state:
+        print("  partial read: " + state["_error"])
+    print("  注：ignore-hosts 是桌面代理自己的绕过列表，不等于 NO_PROXY。")
+    print("  内部主机名默认脱敏；需本机核对细项时加 --show-bypass-hosts。")
+
+
+def _print_controller_diagnostics(controller: str, secret: str | None) -> None:
+    print("\\n[mihomo Controller（只读）]")
+    proxies_status, proxies_payload, proxies_error = _controller_get(controller, "/proxies", secret)
+    connections_status, connections_payload, connections_error = _controller_get(controller, "/connections", secret)
+    if proxies_payload is None:
+        print(f"  GET /proxies: FAIL ({proxies_status or 'no response'}; {proxies_error})")
+    else:
+        current, selected_type, message, is_leaf = _summarize_global(proxies_payload)
+        print(f"  GET /proxies: OK ({proxies_status})")
+        print(f"  GLOBAL.now = {current}")
+        print(f"  selected proxy type = {selected_type}")
+        print("  " + message)
+    if connections_payload is None:
+        print(f"  GET /connections: FAIL ({connections_status or 'no response'}; {connections_error})")
+    else:
+        rows = _connection_rows(connections_payload)
+        print(f"  GET /connections: OK ({connections_status}); active connections = {len(rows)}")
+        if not rows:
+            print("  未发现活动连接；只能说明采样时刻没有返回连接，不能证明目标从未走过代理。")
+        for host, chain, rule in rows[:100]:
+            print(f"  host={host} | chains={chain} | rule={rule or '(none)'}")
+        if len(rows) > 100:
+            print(f"  ... 其余 {len(rows) - 100} 条已省略")
+        print("  纪律：需要配置绕过规则的域名，只从当前 /connections 的 metadata.host 复制；不要沿用旧日志/记忆。")
+
+
+def _print_linux_process_env(pid: int, show_bypass_hosts: bool) -> None:
+    print(f"\\n[目标进程环境（/proc/{pid}/environ）]")
+    values, error = _read_proc_env(pid)
+    if error:
+        print("  unavailable: " + error)
+        return
+    _display_env_layer(f"pid {pid}", values, show_bypass_hosts)
 
 
 def _parse_host_port(proxy_url: str) -> tuple[str, int]:
