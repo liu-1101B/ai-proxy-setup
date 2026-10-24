@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
-"""proxy_doctor — AI 工具代理体检（仅标准库）
+"""proxy_doctor — 本机代理诊断（仅标准库）。
 
-用法:
-    python proxy_doctor.py                       # 自动读环境变量里的代理
-    python proxy_doctor.py --proxy http://127.0.0.1:7890
-    python proxy_doctor.py --proxy ... --target https://api.github.com   # 指定要测的目标
-
-检查项:
-    1. 代理环境变量（进程级 / 用户级 / 机器级 三层）
-    2. 代理端口是否在监听
-    3. 经代理 / 直连 的出口 IP 对比
-    4. HTTP 与 HTTPS 双通道探测
-    5. 结果汇总与建议
+默认检查当前进程环境、~/.dsh/.env（若存在）和 Linux GNOME 系统代理。
+可选参数 --pid 检查目标进程的代理环境，--controller 只读读取 mihomo
+/proxies 和 /connections。诊断工具不会替用户切换 GLOBAL 或写入系统代理。
 """
 
 from __future__ import annotations
@@ -647,7 +639,8 @@ def main() -> int:
     targets = list(DEFAULT_TARGETS)
     for extra in args.target:
         targets.append(("custom", extra, 200))
-    print("\n[目标可达性（通过指定代理；不是对所有应用通道的证明）]")
+    test_path = "指定代理 " + _safe_display_url(proxy) if proxy else "直连（未指定 --proxy）"
+    print("\n[目标可达性（" + test_path + "；不是对所有应用通道的证明）]")
     for kind, url, expect in targets:
         status, _body, err = _fetch(url, proxy)
         ok = status == expect
