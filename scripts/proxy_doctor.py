@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -38,7 +39,9 @@ DEFAULT_TARGETS = [
     ("https", "https://www.gstatic.com/generate_204", 204),
     ("https", "https://api.github.com/", 200),
 ]
-IP_ENDPOINTS = ["http://api.ip.sb/ip", "http://ip-api.com/line/?fields=query,country"]
+# These endpoints receive the caller's public IP when --skip-ip is not used.
+# Use HTTPS so the diagnostic does not disclose it over plaintext HTTP.
+IP_ENDPOINTS = ["https://api.ipify.org", "https://api.ip.sb/ip"]
 
 
 def _load_proxy_from_env() -> str | None:
@@ -50,26 +53,99 @@ def _load_proxy_from_env() -> str | None:
     return None
 
 
+def _safe_display_url(value: str) -> str:
+    """Hide URL userinfo, query values, and fragments before logging URLs."""
+    raw = value.strip()
+    if not raw:
+        return raw
+    candidate = raw if "://" in raw else "http://" + raw
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = "[" + host + "]"
+        try:
+            port = parsed.port
+        except ValueError:
+            return "<invalid URL; details hidden>"
+        netloc = host + ((":" + str(port)) if port is not None else "")
+        if parsed.username is not None or parsed.password is not None:
+            netloc = "<redacted>@" + netloc
+        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = urllib.parse.urlencode([(key, "<redacted>") for key, _ in pairs])
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
+    except Exception:
+        return "<URL hidden>"
+
+
+def _safe_no_proxy(value: str) -> str:
+    """Keep loopback entries visible but mask custom/internal hostnames."""
+    visible = {"localhost", "127.0.0.1", "::1"}
+    entries = [item.strip() for item in value.split(",") if item.strip()]
+    rendered = []
+    hidden_index = 0
+    for entry in entries:
+        if entry.lower() in visible:
+            rendered.append(entry)
+        else:
+            hidden_index += 1
+            rendered.append("<custom-entry-%d>" % hidden_index)
+    return ",".join(rendered) if rendered else ""
+
+
+def _display_env_value(name: str, value: str) -> str:
+    if not value:
+        return "(空)"
+    upper = name.upper()
+    if upper in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}:
+        return _safe_display_url(value)
+    if upper == "NO_PROXY":
+        return _safe_no_proxy(value)
+    return value
+
+
+def _redact_text(value: str) -> str:
+    """Best-effort removal of URL credentials and query values from errors."""
+    value = re.sub(
+        r"(?i)(https?://)[^/\s:@]+(?::[^/@\s]*)?@",
+        r"\1<redacted>@",
+        value,
+    )
+    return re.sub(
+        r"([?&][^=&#\s]+)=([^&#\s]+)",
+        r"\1<redacted>",
+        value,
+    )
+
+
 def _env_layers() -> dict[str, dict[str, str]]:
-    """Windows 上读三层；非 Windows 只报进程级。"""
+    """Read process/user/machine proxy variables on Windows; process elsewhere."""
     names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_USE_ENV_PROXY")
     layers: dict[str, dict[str, str]] = {
         "process": {n: os.environ.get(n, "") for n in names},
     }
     if sys.platform == "win32":
-        try:
-            import winreg  # noqa: WPS433
+        import winreg  # noqa: WPS433
 
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-                user = {}
-                for n in names:
-                    try:
-                        user[n] = str(winreg.QueryValueEx(key, n)[0])
-                    except FileNotFoundError:
-                        user[n] = ""
-                layers["user(HKCU)"] = user
-        except Exception as exc:  # pragma: no cover - 权限/注册表异常
-            layers["user(HKCU)"] = {"error": str(exc)}
+        for layer_name, hive, subkey in (
+            ("user(HKCU)", winreg.HKEY_CURRENT_USER, "Environment"),
+            (
+                "machine(HKLM)",
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            ),
+        ):
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    values = {}
+                    for name in names:
+                        try:
+                            values[name] = str(winreg.QueryValueEx(key, name)[0])
+                        except FileNotFoundError:
+                            values[name] = ""
+                    layers[layer_name] = values
+            except Exception as exc:  # pragma: no cover - registry permissions
+                layers[layer_name] = {"error": str(exc)}
     return layers
 
 
@@ -103,7 +179,7 @@ def _fetch(url: str, proxy: str | None, timeout: float = 15.0) -> tuple[int, byt
     except urllib.error.HTTPError as exc:  # 有响应但非 2xx
         return exc.code, b"", f"HTTPError {exc.code}"
     except Exception as exc:  # noqa: BLE001 - 诊断脚本，需要吞掉所有网络异常
-        return 0, b"", f"{type(exc).__name__}: {exc}"
+        return 0, b"", f"{type(exc).__name__}: {_redact_text(str(exc))[:160]}"
 
 
 def _exit_ip(proxy: str | None) -> str:
@@ -143,7 +219,7 @@ def main() -> int:
     for layer, values in _env_layers().items():
         print(f"  {layer}:")
         for name, value in values.items():
-            shown = value if value else "(空)"
+            shown = _display_env_value(name, value) if name != "error" else value
             print(f"    {name:<18} = {shown}")
 
     if not proxy:
@@ -185,7 +261,7 @@ def main() -> int:
         status, _body, err = _fetch(url, proxy)
         ok = status == expect
         mark = "✓" if ok else "✗"
-        print(f"  [{kind}] {url}")
+        print(f"  [{kind}] {_safe_display_url(url)}")
         print(f"        -> {status} {('(期望 %s)' % expect) if status else ''} {err}".rstrip())
         if not ok:
             problems.append(f"{url} 经代理返回 {status or err}")
