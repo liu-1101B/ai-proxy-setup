@@ -63,7 +63,7 @@ python scripts/proxy_doctor.py --controller http://127.0.0.1:9799 --secret-env M
 2. **内核活着不代表选中节点活着**：看 `/proxies` 的 `GLOBAL.now` 及该条目的 `type`。GLOBAL 钉在叶子节点并持续恒定超时时，别只重试三次；考虑把持久配置中的默认选项改为 URLTest/Fallback 组。
 3. **域名只从实时 `/connections` 复制**：不信旧日志、截图或印象；同时检查 `chains`。
 4. **三层各管各的**：目标进程环境、`~/.dsh/.env`、GNOME `ignore-hosts` 不是同一份配置。
-5. **Controller 改动可能不落盘**：内核重启后再次检查端口和 `GLOBAL.now`。要持久化应修改受管理的配置文件/订阅覆写，或把复查加入每次重启清单。
+5. **Controller 改动可能不落盘**：内核重启后再次检查端口和 `GLOBAL.now`。本次 Ninja 配置中的 `auto_launch: false` 还意味着重启后不能假定内核自动启动；先手动确认/启动内核，再复查选择。要持久化应修改受管理的配置文件/订阅覆写，或把复查加入每次重启清单。
 6. **undici 不应使用 CIDR 绕过规则**：本次使用场景中 `10.0.0.0/8` 不生效；按目标客户端支持的语法逐项配置实际 IP/hostname。
 
 ## 隐私与沙箱边界
