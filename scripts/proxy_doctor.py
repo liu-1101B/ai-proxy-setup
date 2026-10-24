@@ -28,6 +28,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 # 中文 Windows 控制台默认 GBK，打印 ✓/✗/→ 会抛 UnicodeEncodeError。
 # 显式把 stdout/stderr 切成 UTF-8，并允许无法编码时替换而非崩溃。
@@ -533,13 +534,25 @@ def _exit_ip(proxy: str | None) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="AI 工具代理体检")
-    parser.add_argument("--proxy", default=None, help="代理 URL，默认读环境变量")
+    parser = argparse.ArgumentParser(description="AI 工具代理体检（Linux / Windows）")
+    parser.add_argument("--proxy", default=None, help="要测试的代理 URL，默认取进程环境或 ~/.dsh/.env")
     parser.add_argument("--target", action="append", default=[], help="额外要测的 URL")
     parser.add_argument("--skip-ip", action="store_true", help="跳过出口 IP 对比")
+    parser.add_argument("--pid", type=int, default=None, help="Linux 下读取目标 PID 的 /proc/PID/environ")
+    parser.add_argument("--controller", default=None, help="mihomo Controller 基础 URL，例如 http://127.0.0.1:9799")
+    parser.add_argument("--secret", default=None, help="Controller Bearer secret（注意可能出现在进程列表；优先用 --secret-env）")
+    parser.add_argument("--secret-env", default="MIHOMO_CONTROLLER_SECRET", help="从指定环境变量读取 Controller secret（默认 MIHOMO_CONTROLLER_SECRET）")
+    parser.add_argument("--show-bypass-hosts", action="store_true", help="显示精确 NO_PROXY / GNOME ignore-hosts 条目；输出可能含内部域名")
     args = parser.parse_args()
 
+    dsh_env_path = Path.home() / ".dsh" / ".env"
+    dsh_values, dsh_env_error = _read_proxy_env_file(dsh_env_path)
     proxy = args.proxy or _load_proxy_from_env()
+    if not proxy:
+        proxy = _load_proxy_from_values(dsh_values)
+        if proxy:
+            print("未找到进程级代理变量；诊断代理来自 ~/.dsh/.env（只用于本次测试，不修改进程环境）。")
+
     problems: list[str] = []
     advice: list[str] = []
 
@@ -547,73 +560,121 @@ def main() -> int:
     print("proxy_doctor — AI 工具代理体检")
     print("=" * 60)
 
-    # 1) 环境变量三层
-    print("\n[1] 代理环境变量（三层）")
+    # 1) 当前进程环境变量（Windows 同时读取用户/机器级注册表）。
+    print("\n[1] 进程 / 用户 / 机器代理环境")
     for layer, values in _env_layers().items():
-        print(f"  {layer}:")
-        for name, value in values.items():
-            shown = _display_env_value(name, value) if name != "error" else value
-            print(f"    {name:<18} = {shown}")
+        _display_env_layer(layer, values, args.show_bypass_hosts)
+
+    # 2) DSH 专属 dotenv 文件。只读代理相关键，不读取或打印其他 secret。
+    print(f"\n[2] DSH 专属环境（{dsh_env_path}）")
+    if dsh_env_error == "not found":
+        print("  文件不存在")
+    elif dsh_env_error:
+        print("  文件不可读: " + dsh_env_error)
+    elif dsh_values:
+        _display_env_layer("~/.dsh/.env", dsh_values, args.show_bypass_hosts)
+    else:
+        print("  文件存在，但未找到代理相关变量")
+
+    # 3) 可选读取某个目标应用真正启动时携带的环境。
+    if args.pid is not None:
+        if args.pid <= 0:
+            parser.error("--pid must be a positive integer")
+        _print_linux_process_env(args.pid, args.show_bypass_hosts)
+
+    # 4) GNOME 桌面系统代理是独立通道，与 NO_PROXY 不互通。
+    if sys.platform.startswith("linux"):
+        _print_gnome_proxy(args.show_bypass_hosts)
 
     if not proxy:
-        problems.append("没有找到任何代理变量")
-        advice.append("显式设置 HTTPS_PROXY/ALL_PROXY，或用 --proxy 指定")
+        problems.append("未找到可用于主动连通性测试的代理 URL")
+        advice.append("用 --proxy 指定代理；或确认进程环境 / ~/.dsh/.env 中存在代理变量")
 
-    # 2) 端口
+    # 5) 监听端口。GUI 进程存在不代表 mihomo 内核/监听端口还活着。
     if proxy:
-        host, port = _parse_host_port(proxy)
-        print(f"\n[2] 代理端口 {host}:{port}")
-        if _port_open(host, port):
-            print("  在监听 ✓")
+        try:
+            host, port = _parse_host_port(proxy)
+        except ValueError:
+            host, port = "", 0
+        print(f"\n[代理监听端口] {host}:{port}")
+        if host and port and _port_open(host, port):
+            print("  LISTENING")
         else:
-            print("  未监听 ✗")
-            problems.append(f"代理端口 {host}:{port} 没有监听")
-            advice.append("先启动代理软件；或在 TUN 模式下检查端口是否被改写")
+            print("  NOT LISTENING")
+            problems.append(f"代理端口 {host}:{port} 未监听")
+            matches = _matching_proxy_processes()
+            if matches:
+                names = ", ".join(f"{pid}:{name}" for pid, name in matches[:12])
+                print("  检测到疑似代理 GUI/内核进程: " + names)
+                print("  可能是 GUI 仍在但 mihomo 内核已退出的“内核僵尸态”；请以端口/Controller 是否可达为准。")
+                advice.append("先验证实际代理端口和 Controller 端口；不要仅凭 Ninja/Clash 图标或 GUI 进程判断内核存活")
+            else:
+                advice.append("先启动/重启代理内核并确认监听端口；单看 GUI 进程不构成内核存活证据")
 
-    # 3) 出口 IP 对比
+    # 6) mihomo Controller：只读 /proxies 与 /connections，不会自动切节点。
+    if args.controller:
+        secret = args.secret or os.environ.get(args.secret_env, "")
+        try:
+            controller_host, controller_port = _parse_host_port(args.controller)
+        except ValueError:
+            controller_host, controller_port = "", 0
+        if controller_host and controller_port and not _port_open(controller_host, controller_port):
+            print(f"\n[Controller 端口] {controller_host}:{controller_port} NOT LISTENING")
+            matches = _matching_proxy_processes()
+            if matches:
+                names = ", ".join(f"{pid}:{name}" for pid, name in matches[:12])
+                print("  疑似 GUI/代理进程仍存在: " + names)
+                print("  GUI 活着但 Controller 端口不通，需按“GUI 与内核分离”方向排查。")
+            else:
+                print("  未发现常见代理进程名；仍应以端口和 Controller 响应判断内核状态。")
+        _print_controller_diagnostics(args.controller, secret)
+        if args.secret:
+            print("  安全提示：--secret 可能短暂暴露在系统进程列表；推荐用环境变量并传 --secret-env。")
+
+    # 7) 出口 IP 对比。使用 HTTPS 公共端点；可用 --skip-ip 跳过。
     if proxy and not args.skip_ip:
-        print("\n[3] 出口 IP 对比")
+        print("\n[出口 IP 对比]")
         via = _exit_ip(proxy)
         direct = _exit_ip(None)
         print(f"  经代理: {via}")
         print(f"  直连  : {direct}")
         if via == direct and via != "(取不到)":
-            problems.append("经代理与直连的出口 IP 相同")
-            advice.append("若开了 TUN/透明代理，两者相同是正常的（直连也被内核劫持）；"
-                          "否则说明代理被规则绕过，检查该目标是否命中直连规则")
+            advice.append("两条路径出口 IP 相同不一定代表故障；TUN/透明代理也可能接管直连流量。")
         elif via == "(取不到)":
-            problems.append("经代理取不到出口 IP")
-            advice.append("检查代理是否可用、节点是否在线")
+            advice.append("经代理取不到出口 IP；检查代理端口、GLOBAL 当前选择和节点健康状态。")
 
-    # 4) 双通道探测
+    # 8) HTTP/HTTPS 目标探测。多次恒定超时与随机抖动必须分开判断。
     targets = list(DEFAULT_TARGETS)
     for extra in args.target:
         targets.append(("custom", extra, 200))
-    print("\n[4] 目标可达性（经代理）")
+    print("\n[目标可达性（通过指定代理；不是对所有应用通道的证明）]")
     for kind, url, expect in targets:
         status, _body, err = _fetch(url, proxy)
         ok = status == expect
-        mark = "✓" if ok else "✗"
         print(f"  [{kind}] {_safe_display_url(url)}")
         print(f"        -> {status} {('(期望 %s)' % expect) if status else ''} {err}".rstrip())
         if not ok:
-            problems.append(f"{url} 经代理返回 {status or err}")
-            advice.append(f"若 {kind.upper()} 全部失败、且 curl 在别的终端能通，先怀疑本进程/沙箱的网络限制")
+            problems.append(f"{_safe_display_url(url)} 经指定代理返回 {status or err}")
+            advice.append("若失败是恒定超时，先检查 GLOBAL.now 与该节点健康；不要把所有失败都归因于节点抖动。")
 
-    # 5) 汇总
-    print("\n[5] 汇总")
-    if not problems:
-        print("  未发现明显问题 ✓")
+    print("\n[结论与建议]")
+    if not problems and not advice:
+        print("  未发现明显问题；这不证明每条应用网络通道都正确。")
     else:
-        print(f"  发现 {len(problems)} 个问题：")
-        for item in problems:
-            print(f"    - {item}")
-    if advice:
-        print("\n  建议：")
-        for item in dict.fromkeys(advice):  # 去重但保序
-            print(f"    • {item}")
+        if problems:
+            print(f"  检测到 {len(problems)} 项待核查问题：")
+            for item in problems:
+                print("    - " + item)
+        if advice:
+            print("  建议：")
+            for item in dict.fromkeys(advice):
+                print("    - " + item)
 
-    print("\n提示：代理变量的改动只对新进程生效；已运行的应用需要重启。")
+    print("\n诊断纪律：")
+    print("  1. 模型流量到底走哪条通道，应由实际应用 /connections 中的当前 host 与 chains 判断。")
+    print("  2. 配置绕过域名只从实时 /connections metadata.host 复制，不信旧日志或印象。")
+    print("  3. 环境变量 NO_PROXY 只对实际读取它的客户端生效；GNOME system proxy 使用自己的 ignore-hosts。")
+    print("  4. GLOBAL 的 API 选择可能只存在于运行态；重启内核后必须复查 GLOBAL.now。")
     print("=" * 60)
     return 0
 
