@@ -106,7 +106,7 @@ def _parse_proc_env_bytes(data: bytes) -> dict[str, str]:
     """Extract only proxy-related environment variables from /proc/PID/environ."""
     values = {}
     allowed = {name.upper() for name in PROXY_ENV_NAMES}
-    for item in data.split(b"\\0"):
+    for item in data.split(b"\0"):
         if b"=" not in item:
             continue
         key, value = item.split(b"=", 1)
@@ -425,7 +425,7 @@ def _display_env_layer(layer_name: str, values: dict[str, str], show_bypass_host
 
 
 def _print_gnome_proxy(show_bypass_hosts: bool) -> None:
-    print("\\n[GNOME 桌面系统代理（gsettings）]")
+    print("\n[GNOME 桌面系统代理（gsettings）]")
     state = _gnome_proxy_state()
     if "_error" in state and not any(key in state for key in ("mode", "http-host", "https-host", "socks-host")):
         print("  unavailable: " + state["_error"])
@@ -449,7 +449,7 @@ def _print_gnome_proxy(show_bypass_hosts: bool) -> None:
 
 
 def _print_controller_diagnostics(controller: str, secret: str | None) -> None:
-    print("\\n[mihomo Controller（只读）]")
+    print("\n[mihomo Controller（只读）]")
     proxies_status, proxies_payload, proxies_error = _controller_get(controller, "/proxies", secret)
     connections_status, connections_payload, connections_error = _controller_get(controller, "/connections", secret)
     if proxies_payload is None:
