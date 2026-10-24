@@ -53,7 +53,7 @@ $p = 'http://127.0.0.1:7890'   # 换成你自己的混合端口（Clash 常见 7
 1. **目标进程环境**：环境变量是进程启动时继承的快照。查看 PID（将 `<PID>` 替换为真实进程号；输出可能包含代理凭据，只在本机查看，不要直接贴到 Issue）：
 
    ```bash
-   tr '\\0' '\\n' < /proc/<PID>/environ | grep -Ei '^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|NODE_USE_ENV_PROXY)='
+   tr '\0' '\n' < /proc/<PID>/environ | grep -Ei '^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|NODE_USE_ENV_PROXY)='
    ```
 
    若权限允许，诊断脚本也支持 `--pid <PID>`，仅提取代理相关键并对 URL 凭据脱敏。更可靠的方式之一是从目标应用真实启动的子进程里检查它拿到的环境，而不是在另一个终端检查自己的 shell。
@@ -88,17 +88,17 @@ $p = 'http://127.0.0.1:7890'   # 换成你自己的混合端口（Clash 常见 7
 ## 2. 隔离：`NO_PROXY` 不是可选优化，是防事故的保险
 
 **症状**：代理配好后，AI 工具的模型对话开始报 `transport failed` / 连接中断 / 回答卡住。
-**根因**：模型 API 也被塞进了代理。代理节点一抖，模型连接就断——**而模型连接是整个会话的命脉**。
+**一种可能根因**：对确实读取环境变量的客户端，模型 API 未被 `NO_PROXY` 排除，导致请求经代理出站。**但这不是所有客户端的通用根因**：若应用走 GNOME 桌面系统代理、CLI 自有配置或 TUN，必须查对应通道。
 
 **正确做法**：
 
 ```
-工具出网（web_fetch / 搜索 / 下载）  →  走代理
-模型与关键 API 连接                   →  直连（进 NO_PROXY）
-本机与内网                            →  直连（永远）
+工具出网（web_fetch / 搜索 / 下载）  →  按该工具真实使用的通道配置
+模型与关键 API 连接                   →  依客户端能力选择环境变量绕过 / GNOME ignore-hosts / 其他专属规则
+本机与内网                            →  按客户端与内核规则分别验证
 ```
 
-实测案例：`NO_PROXY` 只排了 `127.0.0.1,localhost,::1` 时，模型 API 和遥测域名全走境外节点，**间歇性 transport error**；补上模型域名后，Clash 的连接列表里该域名的条目归零，故障消失。
+历史实测案例（环境变量客户端）：`NO_PROXY` 只排了 `127.0.0.1,localhost,::1` 时，模型 API 和遥测域名全走境外节点，**间歇性 transport error**；补上模型域名后，Clash 的连接列表里该域名的条目归零，故障消失。这与本手册中的 Linux GNOME/Tauri 案例属于不同通道，不能混为一个根因。
 
 **判断域名的硬性纪律**：
 
@@ -200,11 +200,23 @@ curl http://api.ip.sb/ip                               # 直连
 
 ### 5.2 Clash / mihomo 控制器（最有用的一招）
 
+端口取决于本机配置；本次 Linux 环境的示例是 `127.0.0.1:9799`，并非通用默认值。先检查运行态：
+
 ```bash
-# 需要配置文件里的 external-controller 和 secret
-curl -H "Authorization: Bearer <secret>" http://127.0.0.1:9090/configs
-curl -H "Authorization: Bearer <secret>" http://127.0.0.1:9090/proxies
-curl -H "Authorization: Bearer <secret>" http://127.0.0.1:9090/connections
+# 最好先将 secret 放入环境变量，避免写在命令行参数里
+export MIHOMO_CONTROLLER_SECRET='替换成你的 secret'
+python scripts/proxy_doctor.py \
+  --proxy http://127.0.0.1:7897 \
+  --controller http://127.0.0.1:9799 \
+  --secret-env MIHOMO_CONTROLLER_SECRET \
+  --skip-ip
+```
+
+也可以直接读取原始 API（仅在本机终端执行；不要分享含 secret 的命令/日志）：
+
+```bash
+curl -H "Authorization: Bearer $MIHOMO_CONTROLLER_SECRET" http://127.0.0.1:9799/proxies
+curl -H "Authorization: Bearer $MIHOMO_CONTROLLER_SECRET" http://127.0.0.1:9799/connections
 ```
 
 能拿到当前选择器和**每条活动连接的实时 hostname 与出站链路**：
@@ -224,7 +236,7 @@ curl -H "Authorization: Bearer <secret>" http://127.0.0.1:9090/connections
 python scripts/proxy_doctor.py --proxy http://127.0.0.1:7890
 ```
 
-输出：当前进程环境、DSH 的 `~/.dsh/.env`、Linux 目标 PID 环境（可选）、GNOME 系统代理（含 `ignore-hosts`）、代理端口状态、出口 IP 与 HTTP/HTTPS 测试。还可通过 `--controller` 只读获取 mihomo 的 `/proxies` 和 `/connections`，显示 `GLOBAL.now`、选择器类型与实时 host/chains。
+输出：当前进程环境、DSH 的 `~/.dsh/.env`、Linux 目标 PID 环境（可选）、GNOME 系统代理（含 `ignore-hosts`）、代理端口状态、出口 IP 与 HTTP/HTTPS 测试。还可通过 `--controller` 只读获取 mihomo 的 `/proxies` 和 `/connections`，显示 `GLOBAL.now`、选择器类型与实时 host/chains。示例：`python scripts/proxy_doctor.py --controller http://127.0.0.1:9799 --secret-env MIHOMO_CONTROLLER_SECRET --pid <PID> --skip-ip`。默认只读，不会切换节点；若需查看完整绕过列表，可加 `--show-bypass-hosts`，但输出可能含内部域名。
 
 ---
 
