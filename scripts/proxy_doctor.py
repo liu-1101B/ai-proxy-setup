@@ -467,7 +467,7 @@ def _print_controller_diagnostics(controller: str, secret: str | None) -> None:
 
 
 def _print_linux_process_env(pid: int, show_bypass_hosts: bool) -> None:
-    print(f"\\n[目标进程环境（/proc/{pid}/environ）]")
+    print(f"\n[目标进程环境（/proc/{pid}/environ）]")
     values, error = _read_proc_env(pid)
     if error:
         print("  unavailable: " + error)
