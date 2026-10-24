@@ -120,7 +120,7 @@ def _read_proc_env(pid: int) -> tuple[dict[str, str], str]:
     if not sys.platform.startswith("linux"):
         return {}, "available only on Linux"
     try:
-        data = Path("/proc") .joinpath(str(pid), "environ").read_bytes()
+        data = Path("/proc").joinpath(str(pid), "environ").read_bytes()
         return _parse_proc_env_bytes(data), ""
     except PermissionError:
         return {}, "permission denied (try the same user, or inspect from the app's own child process)"
