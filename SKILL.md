@@ -77,6 +77,20 @@ $p = 'http://127.0.0.1:7890'   # 换成你自己的混合端口（Clash 常见 7
    gsettings get org.gnome.system.proxy ignore-hosts
    ```
 
+   如果确认应用确实走 GNOME 桌面系统代理，并需要把一个 hostname 加入绕过列表，可在记录原值后手动更新。下面是示意；它会**替换整个 ignore-hosts 列表**，必须保留你原有的条目，只把从实时 `/connections` 取得的正确 hostname 追加进去：
+
+   ```bash
+   # 先完整记录当前值
+   gsettings get org.gnome.system.proxy ignore-hosts
+
+   # 示例列表；请把现有条目保留，并替换为真实 hostname/IP
+   gsettings set org.gnome.system.proxy ignore-hosts "['localhost', '127.0.0.1', '::1', 'hif-leim.deepseek.com']"
+
+   # 改完重新触发请求，再从 /connections 验证 chains 是否已改变
+   ```
+
+   不要盲目照抄示例域名或覆盖已有内网条目。GNOME 的列表匹配规则和具体客户端行为也要在实际环境中验证。脚本只读取状态，不会执行上述写操作。
+
    GNOME 的 `ignore-hosts` 与 `NO_PROXY` 不是同一个列表。若应用使用 GNOME 桌面代理，务必在这里检查是否包含**实际连接的 hostname**。更改系统代理设置可能影响整台桌面会话；请先读取和记录原值。
 
 **沙箱权限边界**：有些 Agent 沙箱不仅无法正确探测网络，还可能因为无法访问会话 D-Bus、`dconf` 或 `/run/user/<uid>` 而不能读取/更改 GNOME 设置。诊断输出中的 `unavailable` 不等于配置为空或代理关闭。需要改系统设置时，可能必须由用户在真实桌面会话中手动执行 `gsettings`，不要从受限沙箱里反复重试写入。
@@ -341,7 +355,7 @@ await fetch('http://127.0.0.1:9090/proxies/GLOBAL', {
 - **另外两个独立故障**：
   1. Ninja GUI 仍显示运行，但 mihomo 内核已退出；先检查端口/Controller。
   2. 内核和端口正常，但 GLOBAL 手动钉在失效节点；`GLOBAL.now` 指向具体叶子节点时，持续恒定超时不应简单归类为随机抖动。
-- **重启纪律**：Controller API 修改不一定落盘；如果默认配置仍指向死节点，内核重启后会复发。每次重启先确认内核端口，再复查 `GLOBAL.now`。
+- **重启纪律**：Controller API 修改不一定落盘；如果默认配置仍指向死节点，内核重启后会复发。此次 Ninja 配置中的 `auto_launch: false` 还意味着重启后不能假设内核会自动启动。每次重启后先手动确认/启动 Ninja 与 mihomo 内核，检查端口和 Controller，再复查 `GLOBAL.now`。
 - **边界**：这些结论描述本次 Linux/GNOME/DSH/Ninja 环境；其他客户端的网络栈与系统代理行为应单独验证。
 
 ### 案例 B：游戏「启动器登录组件报错」
